@@ -15,26 +15,43 @@ import random
 from typing import List
 import traceback
 
-# ------------------ CONFIG ------------------
+
 UPLOAD_DIR = "uploads"
 DB_FILE = "embeddings_db.npy"
 IMG_DB_FILE = "image_paths_db.npy"
-EMBEDDING_THRESHOLD = 0.85  
-ORB_MATCH_THRESHOLD = 50   
+EMBEDDING_THRESHOLD = 0.85
+ORB_MATCH_THRESHOLD = 50
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ------------------ CLEAN EMPTY FILES ------------------
 for f in [DB_FILE, IMG_DB_FILE]:
     if os.path.exists(f) and os.path.getsize(f) == 0:
         os.remove(f)
 
-# ------------------ IMAGE CLASSIFICATION ------------------
-class_model = models.mobilenet_v2(weights=None)
-class_model.classifier[1] = nn.Linear(class_model.last_channel, 2)  # Mangrove / Non-Mangrove
-class_model.load_state_dict(torch.load("mangrove_mobilenetv2.pth", map_location=device))
-class_model.eval().to(device)
+
+class_model = None
+resnet = None
+
+def get_class_model():
+    global class_model
+    if class_model is None:
+        model = models.mobilenet_v2(weights=None)
+        model.classifier[1] = nn.Linear(model.last_channel, 2)  # Mangrove / Non-Mangrove
+        model.load_state_dict(torch.load("mangrove_mobilenetv2.pth", map_location=device))
+        model.eval().to(device)
+        class_model = model
+    return class_model
+
+def get_resnet_model():
+    global resnet
+    if resnet is None:
+        model = models.resnet50(weights=ResNet50_Weights.DEFAULT)
+        model.fc = nn.Identity()
+        model = model.to(device)
+        model.eval()
+        resnet = model
+    return resnet
 
 class_transform = transforms.Compose([
     transforms.Resize((224, 224)),
@@ -43,32 +60,29 @@ class_transform = transforms.Compose([
                          [0.229, 0.224, 0.225])
 ])
 
+
 def classify_image(img_path):
+    model = get_class_model()
     img = Image.open(img_path).convert("RGB")
     x = class_transform(img).unsqueeze(0).to(device)
     with torch.no_grad():
-        preds = class_model(x)
+        preds = model(x)
         _, pred_class = torch.max(preds, 1)
     return "Mangrove" if pred_class.item() == 1 else "Non-Mangrove"
 
-# ------------------ ANOMALY DETECTION ------------------
-resnet = models.resnet50(weights=ResNet50_Weights.DEFAULT)
-resnet.fc = nn.Identity()
-resnet = resnet.to(device)
-resnet.eval()
 
 def get_embedding(img_path):
+    model = get_resnet_model()
     img = Image.open(img_path).convert("RGB")
     x = class_transform(img).unsqueeze(0).to(device)
     with torch.no_grad():
-        emb = resnet(x).squeeze()
-        if emb.ndim == 0:  # scalar case
+        emb = model(x).squeeze()
+        if emb.ndim == 0:
             emb = emb.unsqueeze(0)
         emb = emb.cpu().numpy()
     return emb / np.linalg.norm(emb)
 
 def load_db():
-    """Load embeddings and paths safely; handle empty or corrupted files."""
     if os.path.exists(DB_FILE) and os.path.exists(IMG_DB_FILE):
         if os.path.getsize(DB_FILE) == 0 or os.path.getsize(IMG_DB_FILE) == 0:
             return [], []
@@ -77,13 +91,13 @@ def load_db():
             paths = np.load(IMG_DB_FILE, allow_pickle=True).tolist()
             return embeddings, paths
         except Exception:
-            # If file is corrupted
             return [], []
     return [], []
 
 def save_db(embeddings, paths):
     np.save(DB_FILE, np.array(embeddings, dtype=object))
     np.save(IMG_DB_FILE, np.array(paths, dtype=object))
+
 
 def orb_similarity(img1_path, img2_path):
     img1 = cv2.imread(img1_path, 0)
@@ -102,12 +116,7 @@ def check_duplicate(new_img_path, filename):
     embeddings, paths = load_db()
     new_emb = get_embedding(new_img_path)
 
-    anomaly = {
-        "status": None,
-        "matched_with": None,
-        "similarity": None,
-        "message": None
-    }
+    anomaly = {"status": None, "matched_with": None, "similarity": None, "message": None}
 
     if not embeddings:
         embeddings.append(new_emb)
@@ -146,7 +155,7 @@ def check_duplicate(new_img_path, filename):
     anomaly.update({"status": "stored", "message": "New unique image stored"})
     return anomaly
 
-# ------------------ DENSITY & HEIGHT ------------------
+
 def calculate_density(img_path):
     img = cv2.imread(img_path)
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
@@ -161,8 +170,9 @@ def get_height():
     height = round(random.uniform(5.0, 7.0), 2)
     return f"Approx {height} ft (above water)"
 
-# ------------------ FASTAPI APP ------------------
+
 app = FastAPI()
+
 @app.post("/analyze")
 async def analyze(
     horizontals: List[UploadFile] = File(...),
@@ -174,7 +184,6 @@ async def analyze(
         anomaly_status_counts = {"stored": 0, "duplicate": 0, "duplicate_cropped": 0}
         density_list = []
 
-        # Process horizontal images
         for idx, horizontal in enumerate(horizontals):
             horiz_path = os.path.join(UPLOAD_DIR, f"horiz_{idx}_{horizontal.filename}")
             with open(horiz_path, "wb") as buffer:
@@ -184,7 +193,6 @@ async def analyze(
             anomaly = check_duplicate(horiz_path, horizontal.filename)
             density = calculate_density(horiz_path)
 
-            # Update counts
             if classification == "Mangrove":
                 mangrove_count += 1
             else:
@@ -195,7 +203,6 @@ async def analyze(
 
         mean_density = round(np.mean(density_list), 2) if density_list else 0.0
 
-        # Process vertical image
         vert_path = os.path.join(UPLOAD_DIR, f"vertical_{vertical.filename}")
         with open(vert_path, "wb") as buffer:
             shutil.copyfileobj(vertical.file, buffer)
@@ -218,3 +225,7 @@ async def analyze(
             content={"error": str(e), "trace": traceback.format_exc()},
             status_code=500
         )
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
