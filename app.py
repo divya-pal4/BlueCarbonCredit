@@ -9,12 +9,10 @@ import os
 import shutil
 from sklearn.metrics.pairwise import cosine_similarity
 import cv2
-from torchvision.models import ResNet50_Weights
-import uvicorn
 import random
 from typing import List
 import traceback
-
+import uvicorn
 
 UPLOAD_DIR = "uploads"
 DB_FILE = "embeddings_db.npy"
@@ -29,29 +27,16 @@ for f in [DB_FILE, IMG_DB_FILE]:
     if os.path.exists(f) and os.path.getsize(f) == 0:
         os.remove(f)
 
+# ------------------- Model Loading -------------------
+class_model = models.mobilenet_v2(weights=None)
+class_model.classifier[1] = nn.Linear(class_model.last_channel, 2)
+class_model.load_state_dict(torch.load("mangrove_mobilenetv2.pth", map_location=device))
+class_model.eval().to(device)
 
-class_model = None
-resnet = None
-
-def get_class_model():
-    global class_model
-    if class_model is None:
-        model = models.mobilenet_v2(weights=None)
-        model.classifier[1] = nn.Linear(model.last_channel, 2)  # Mangrove / Non-Mangrove
-        model.load_state_dict(torch.load("mangrove_mobilenetv2.pth", map_location=device))
-        model.eval().to(device)
-        class_model = model
-    return class_model
-
-def get_resnet_model():
-    global resnet
-    if resnet is None:
-        model = models.resnet50(weights=ResNet50_Weights.DEFAULT)
-        model.fc = nn.Identity()
-        model = model.to(device)
-        model.eval()
-        resnet = model
-    return resnet
+resnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
+resnet.fc = nn.Identity()
+resnet = resnet.to(device)
+resnet.eval()
 
 class_transform = transforms.Compose([
     transforms.Resize((224, 224)),
@@ -60,23 +45,20 @@ class_transform = transforms.Compose([
                          [0.229, 0.224, 0.225])
 ])
 
-
+# ------------------- Helper Functions -------------------
 def classify_image(img_path):
-    model = get_class_model()
     img = Image.open(img_path).convert("RGB")
     x = class_transform(img).unsqueeze(0).to(device)
     with torch.no_grad():
-        preds = model(x)
+        preds = class_model(x)
         _, pred_class = torch.max(preds, 1)
     return "Mangrove" if pred_class.item() == 1 else "Non-Mangrove"
 
-
 def get_embedding(img_path):
-    model = get_resnet_model()
     img = Image.open(img_path).convert("RGB")
     x = class_transform(img).unsqueeze(0).to(device)
     with torch.no_grad():
-        emb = model(x).squeeze()
+        emb = resnet(x).squeeze()
         if emb.ndim == 0:
             emb = emb.unsqueeze(0)
         emb = emb.cpu().numpy()
@@ -90,14 +72,13 @@ def load_db():
             embeddings = np.load(DB_FILE, allow_pickle=True).tolist()
             paths = np.load(IMG_DB_FILE, allow_pickle=True).tolist()
             return embeddings, paths
-        except Exception:
+        except:
             return [], []
     return [], []
 
 def save_db(embeddings, paths):
     np.save(DB_FILE, np.array(embeddings, dtype=object))
     np.save(IMG_DB_FILE, np.array(paths, dtype=object))
-
 
 def orb_similarity(img1_path, img2_path):
     img1 = cv2.imread(img1_path, 0)
@@ -112,11 +93,10 @@ def orb_similarity(img1_path, img2_path):
     good_matches = [m for m in matches if m.distance < 60]
     return len(good_matches)
 
-def check_duplicate(new_img_path, filename):
+def check_duplicate(new_img_path):
     embeddings, paths = load_db()
     new_emb = get_embedding(new_img_path)
-
-    anomaly = {"status": None, "matched_with": None, "similarity": None, "message": None}
+    anomaly = {"status": None, "matched_with": None, "similarity": None, "orb_matches": None, "message": None}
 
     if not embeddings:
         embeddings.append(new_emb)
@@ -155,7 +135,6 @@ def check_duplicate(new_img_path, filename):
     anomaly.update({"status": "stored", "message": "New unique image stored"})
     return anomaly
 
-
 def calculate_density(img_path):
     img = cv2.imread(img_path)
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
@@ -170,7 +149,7 @@ def get_height():
     height = round(random.uniform(5.0, 7.0), 2)
     return f"Approx {height} ft (above water)"
 
-
+# ------------------- FastAPI App -------------------
 app = FastAPI()
 
 @app.post("/analyze")
@@ -190,7 +169,7 @@ async def analyze(
                 shutil.copyfileobj(horizontal.file, buffer)
 
             classification = classify_image(horiz_path)
-            anomaly = check_duplicate(horiz_path, horizontal.filename)
+            anomaly = check_duplicate(horiz_path)
             density = calculate_density(horiz_path)
 
             if classification == "Mangrove":
@@ -226,6 +205,6 @@ async def analyze(
             status_code=500
         )
 
-
 if __name__ == "__main__":
+
     uvicorn.run(app, host="0.0.0.0", port=8000)
