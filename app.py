@@ -12,7 +12,6 @@ import cv2
 import random
 from typing import List
 import traceback
-import uvicorn
 
 UPLOAD_DIR = "uploads"
 DB_FILE = "embeddings_db.npy"
@@ -21,44 +20,54 @@ EMBEDDING_THRESHOLD = 0.85
 ORB_MATCH_THRESHOLD = 50
 
 os.makedirs(UPLOAD_DIR, exist_ok=True)
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device = torch.device("cpu")  # Force CPU to avoid OOM on Render
 
 for f in [DB_FILE, IMG_DB_FILE]:
     if os.path.exists(f) and os.path.getsize(f) == 0:
         os.remove(f)
 
-# ------------------- Model Loading -------------------
-class_model = models.mobilenet_v2(weights=None)
-class_model.classifier[1] = nn.Linear(class_model.last_channel, 2)
-class_model.load_state_dict(torch.load("mangrove_mobilenetv2.pth", map_location=device))
-class_model.eval().to(device)
-
-resnet = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
-resnet.fc = nn.Identity()
-resnet = resnet.to(device)
-resnet.eval()
-
-class_transform = transforms.Compose([
+class_model, resnet_model = None, None
+transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
     transforms.Normalize([0.485, 0.456, 0.406],
                          [0.229, 0.224, 0.225])
 ])
 
-# ------------------- Helper Functions -------------------
+def load_class_model():
+    global class_model
+    if class_model is None:
+        model = models.mobilenet_v2(weights=None)
+        model.classifier[1] = nn.Linear(model.last_channel, 2)
+        model.load_state_dict(torch.load("mangrove_mobilenetv2.pth", map_location=device))
+        model.eval().to(device)
+        class_model = model
+    return class_model
+
+def load_resnet_model():
+    global resnet_model
+    if resnet_model is None:
+        model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)  # smaller
+        model.fc = nn.Identity()
+        model.eval().to(device)
+        resnet_model = model
+    return resnet_model
+
 def classify_image(img_path):
+    model = load_class_model()
     img = Image.open(img_path).convert("RGB")
-    x = class_transform(img).unsqueeze(0).to(device)
+    x = transform(img).unsqueeze(0).to(device)
     with torch.no_grad():
-        preds = class_model(x)
+        preds = model(x)
         _, pred_class = torch.max(preds, 1)
     return "Mangrove" if pred_class.item() == 1 else "Non-Mangrove"
 
 def get_embedding(img_path):
+    model = load_resnet_model()
     img = Image.open(img_path).convert("RGB")
-    x = class_transform(img).unsqueeze(0).to(device)
+    x = transform(img).unsqueeze(0).to(device)
     with torch.no_grad():
-        emb = resnet(x).squeeze()
+        emb = model(x).squeeze()
         if emb.ndim == 0:
             emb = emb.unsqueeze(0)
         emb = emb.cpu().numpy()
@@ -72,7 +81,7 @@ def load_db():
             embeddings = np.load(DB_FILE, allow_pickle=True).tolist()
             paths = np.load(IMG_DB_FILE, allow_pickle=True).tolist()
             return embeddings, paths
-        except:
+        except Exception:
             return [], []
     return [], []
 
@@ -90,25 +99,21 @@ def orb_similarity(img1_path, img2_path):
         return 0
     bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
     matches = bf.match(des1, des2)
-    good_matches = [m for m in matches if m.distance < 60]
-    return len(good_matches)
+    return len([m for m in matches if m.distance < 60])
 
-def check_duplicate(new_img_path):
+def check_duplicate(img_path):
     embeddings, paths = load_db()
-    new_emb = get_embedding(new_img_path)
-    anomaly = {"status": None, "matched_with": None, "similarity": None, "orb_matches": None, "message": None}
-
+    new_emb = get_embedding(img_path)
+    anomaly = {"status": None, "matched_with": None, "similarity": None, "message": None}
     if not embeddings:
         embeddings.append(new_emb)
-        paths.append(new_img_path)
+        paths.append(img_path)
         save_db(embeddings, paths)
         anomaly.update({"status": "stored", "message": "First image stored"})
         return anomaly
-
     sims = cosine_similarity([new_emb], embeddings)[0]
     max_sim = np.max(sims)
     best_idx = np.argmax(sims)
-
     if max_sim >= EMBEDDING_THRESHOLD:
         anomaly.update({
             "status": "duplicate",
@@ -117,20 +122,18 @@ def check_duplicate(new_img_path):
             "message": "Exact or near-exact duplicate"
         })
         return anomaly
-
     for path in paths:
-        good_matches = orb_similarity(new_img_path, path)
-        if good_matches >= ORB_MATCH_THRESHOLD:
+        matches = orb_similarity(img_path, path)
+        if matches >= ORB_MATCH_THRESHOLD:
             anomaly.update({
                 "status": "duplicate_cropped",
                 "matched_with": os.path.basename(path),
-                "orb_matches": good_matches,
-                "message": "Duplicate image detected (possibly cropped/altered)"
+                "orb_matches": matches,
+                "message": "Duplicate (cropped/altered)"
             })
             return anomaly
-
     embeddings.append(new_emb)
-    paths.append(new_img_path)
+    paths.append(img_path)
     save_db(embeddings, paths)
     anomaly.update({"status": "stored", "message": "New unique image stored"})
     return anomaly
@@ -138,73 +141,64 @@ def check_duplicate(new_img_path):
 def calculate_density(img_path):
     img = cv2.imread(img_path)
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    lower_green = np.array([35, 40, 40])
-    upper_green = np.array([85, 255, 255])
-    mask = cv2.inRange(hsv, lower_green, upper_green)
-    green_pixels = np.sum(mask > 0)
-    total_pixels = mask.size
-    return round((green_pixels / total_pixels) * 100, 2)
+    mask = cv2.inRange(hsv, np.array([35,40,40]), np.array([85,255,255]))
+    green_pixels = np.sum(mask>0)
+    return round((green_pixels / mask.size)*100,2)
 
 def get_height():
-    height = round(random.uniform(5.0, 7.0), 2)
-    return f"Approx {height} ft (above water)"
+    return f"Approx {round(random.uniform(5,7),2)} ft (above water)"
 
-# ------------------- FastAPI App -------------------
 app = FastAPI()
 
-@app.post("/analyze")
-async def analyze(
-    horizontals: List[UploadFile] = File(...),
-    vertical: UploadFile = File(...)
-):
+@app.post("/classify")
+async def classify_endpoint(horizontals: List[UploadFile] = File(...)):
     try:
-        mangrove_count = 0
-        non_mangrove_count = 0
-        anomaly_status_counts = {"stored": 0, "duplicate": 0, "duplicate_cropped": 0}
-        density_list = []
-
-        for idx, horizontal in enumerate(horizontals):
-            horiz_path = os.path.join(UPLOAD_DIR, f"horiz_{idx}_{horizontal.filename}")
-            with open(horiz_path, "wb") as buffer:
-                shutil.copyfileobj(horizontal.file, buffer)
-
-            classification = classify_image(horiz_path)
-            anomaly = check_duplicate(horiz_path)
-            density = calculate_density(horiz_path)
-
-            if classification == "Mangrove":
-                mangrove_count += 1
-            else:
-                non_mangrove_count += 1
-
-            anomaly_status_counts[anomaly["status"]] += 1
-            density_list.append(density)
-
-        mean_density = round(np.mean(density_list), 2) if density_list else 0.0
-
-        vert_path = os.path.join(UPLOAD_DIR, f"vertical_{vertical.filename}")
-        with open(vert_path, "wb") as buffer:
-            shutil.copyfileobj(vertical.file, buffer)
-        height = get_height()
-
-        final_result = {
-            "horizontal_summary": {
-                "mangrove_count": mangrove_count,
-                "non_mangrove_count": non_mangrove_count,
-                "anomaly_counts": anomaly_status_counts,
-                "mean_density": mean_density
-            },
-            "height_estimate": height
-        }
-
-        return JSONResponse(content=final_result)
-
+        results=[]
+        for idx, file in enumerate(horizontals):
+            path=os.path.join(UPLOAD_DIR,f"classify_{idx}_{file.filename}")
+            with open(path,"wb") as f:
+                shutil.copyfileobj(file.file,f)
+            cls=classify_image(path)
+            results.append({"image": file.filename,"classification":cls})
+        return JSONResponse({"classification_results": results})
     except Exception as e:
-        return JSONResponse(
-            content={"error": str(e), "trace": traceback.format_exc()},
-            status_code=500
-        )
+        return JSONResponse({"error":str(e),"trace":traceback.format_exc()},status_code=500)
 
-if __name__ == "__main__":
+@app.post("/analyze")
+async def analyze_endpoint(horizontals: List[UploadFile] = File(...), vertical: UploadFile = File(...)):
+    try:
+        mangrove_count=0
+        non_mangrove_count=0
+        anomaly_counts={"stored":0,"duplicate":0,"duplicate_cropped":0}
+        densities=[]
+        for idx,file in enumerate(horizontals):
+            path=os.path.join(UPLOAD_DIR,f"analyze_{idx}_{file.filename}")
+            with open(path,"wb") as f:
+                shutil.copyfileobj(file.file,f)
+            cls=classify_image(path)
+            anomaly=check_duplicate(path)
+            dens=calculate_density(path)
+            mangrove_count+=cls=="Mangrove"
+            non_mangrove_count+=cls=="Non-Mangrove"
+            anomaly_counts[anomaly["status"]]+=1
+            densities.append(dens)
+        mean_density=round(np.mean(densities),2) if densities else 0
+        vert_path=os.path.join(UPLOAD_DIR,f"vertical_{vertical.filename}")
+        with open(vert_path,"wb") as f:
+            shutil.copyfileobj(vertical.file,f)
+        height=get_height()
+        return JSONResponse({
+            "horizontal_summary":{
+                "mangrove_count":mangrove_count,
+                "non_mangrove_count":non_mangrove_count,
+                "anomaly_counts":anomaly_counts,
+                "mean_density":mean_density
+            },
+            "height_estimate":height
+        })
+    except Exception as e:
+        return JSONResponse({"error":str(e),"trace":traceback.format_exc()},status_code=500)
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+if __name__=="__main__":
+    import uvicorn
+    uvicorn.run(app,host="0.0.0.0",port=8000)
